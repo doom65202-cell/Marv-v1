@@ -1,0 +1,28 @@
+# fly.toml — replace 'marv-c-v1' with whatever name you picked in `fly launch`
+app = "marv-c-v1"
+primary_region = "jnb"   # Johannesburg is the closest Fly region to Nairobi;
+                          # change if you'd prefer somewhere else
+
+[build]
+
+[mounts]
+  source = "marv_c_data"
+  destination = "/app/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+# No [[services]] block: this isn't a web server, so nothing needs to be
+# reachable over HTTP. Fly will just keep the machine running.
+
+[processes]
+  app = "node index.js"
+
+# Keep exactly one machine running at all times instead of scaling to zero,
+# since WhatsApp needs a persistent connection to stay "online".
+[deploy]
+  strategy = "rolling"
+
+[restart]
+  policy = "always"
