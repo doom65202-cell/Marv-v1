@@ -17,15 +17,32 @@ const mainMenu = require("./commands/mainMenu");
 const groupMenu = require("./commands/groupMenu");
 const { startKeepAliveServer } = require("./lib/uptime");
 
-const logger = pino({ level: "silent" }); // set to "info" while debugging
+const logger = pino({ level: "silent" });
 const usingPairingCode = config.LOGIN_METHOD === "pairing";
 
 function askQuestion(query) {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => rl.question(query, (answer) => {
-    rl.close();
-    resolve(answer.trim());
-  }));
+  return new Promise((resolve) => {
+    // Non-interactive environments (Render, Railway, etc.) cannot answer prompts.
+    if (!process.stdin.isTTY) {
+      const fallback = process.env.PAIRING_NUMBER || config.OWNER_NUMBER;
+      const digits = fallback ? fallback.replace(/\D/g, "") : "";
+      if (digits.length >= 10) {
+        console.log(`[Non-interactive mode] Using PAIRING_NUMBER / OWNER_NUMBER: ${digits}`);
+        resolve(digits);
+      } else {
+        console.log("[Non-interactive mode] No PAIRING_NUMBER env var set and no valid OWNER_NUMBER in config.");
+        console.log("Hint: set PAIRING_NUMBER env var or switch to LOGIN_METHOD=qr");
+        resolve("");
+      }
+      return;
+    }
+
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(query, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
 }
 
 async function startBot() {
@@ -36,38 +53,27 @@ async function startBot() {
     version,
     logger,
     auth: state,
-    // We drive "online" presence manually (see below) rather than letting
-    // Baileys mark us online only while actively connected.
     markOnlineOnConnect: false,
-    // Pairing codes only work reliably when Baileys presents itself as a
-    // real browser rather than the default "Baileys" fingerprint.
     browser: usingPairingCode ? Browsers.macOS("Desktop") : Browsers.baileys("Chrome"),
     printQRInTerminal: false,
     generateHighQualityLinkPreview: true,
   });
 
-  // Request a pairing code once, right after the socket is created, if
-  // we're not already linked. Only needed for the very first run — once
-  // creds.update has fired and saved a registered session, this is skipped
-  // on subsequent restarts.
   if (usingPairingCode && !sock.authState.creds.registered) {
-    // Always ask — on purpose. We don't silently fall back to a number
-    // baked into config.js or an env var, because a pairing code request
-    // reveals whether that number has WhatsApp and can be used to spam it
-    // with link requests. Typing it in each time means a code is only ever
-    // generated for a number you explicitly hand over right now.
     let number = "";
     while (!number) {
       const answer = await askQuestion("Enter the WhatsApp number to link (with country code, no '+'): ");
       number = answer.replace(/\D/g, "");
-      if (!number) console.log("That doesn't look like a number — digits only, e.g. 254712345678.");
+      if (!number) {
+        console.log("That doesn't look like a number — digits only, e.g. 254712345678.");
+        // Prevent infinite loops in non-interactive environments
+        if (!process.stdin.isTTY) {
+          console.log("Exiting — cannot prompt in non-interactive environment.");
+          process.exit(1);
+        }
+      }
     }
 
-    // Whatever number you just handed over is the account the bot will
-    // actually run as once linked, so treat it as the owner/operating
-    // number from here on — admin checks, "owner" replies, and anti-delete
-    // DMs all follow this number instead of whatever was hardcoded in
-    // config.js.
     config.OWNER_NUMBER = number;
 
     let connected = false;
@@ -84,19 +90,15 @@ async function startBot() {
         console.log("Link a Device → Link with phone number instead → enter this code.");
         console.log("Not connected within 1 minute? A fresh code is generated automatically.\n");
       } catch (err) {
-        console.error("Failed to request pairing code:", err);
+        console.error("Failed to request pairing code:", err.message || err);
       }
     };
 
-    // Small delay avoids a race where the socket isn't fully ready yet.
     setTimeout(() => {
       requestPairingCode();
-      // Pairing codes expire quickly. Keep issuing a new one every 60s
-      // for as long as we're still waiting to connect.
       renewalTimer = setInterval(requestPairingCode, 60_000);
     }, 3000);
 
-    // Stop renewing once we're actually linked and connected.
     sock.ev.on("connection.update", ({ connection }) => {
       if (connection === "open") {
         connected = true;
@@ -107,7 +109,7 @@ async function startBot() {
 
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", (update) => {
+  sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr && !usingPairingCode) {
@@ -119,18 +121,16 @@ async function startBot() {
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       console.log("Connection closed.", statusCode, "Reconnecting:", shouldReconnect);
-      if (shouldReconnect) startBot();
+      if (shouldReconnect) {
+        // Small delay avoids tight reconnection loops
+        setTimeout(() => startBot(), 3000);
+      }
     } else if (connection === "open") {
       console.log(`${config.BOT_NAME} connected.`);
       keepAlwaysOnline(sock);
     }
   });
 
-  // "Indicate I'm online always even when I'm offline" — we periodically
-  // (re)send an 'available' presence broadcast. WhatsApp shows "online"
-  // based on the last presence it received, so refreshing this keeps the
-  // linked number appearing online even if this process's device session
-  // is otherwise idle.
   function keepAlwaysOnline(sock) {
     sock.sendPresenceUpdate("available").catch(() => {});
     setInterval(() => {
@@ -144,8 +144,6 @@ async function startBot() {
     for (const msg of messages) {
       if (!msg.message) continue;
 
-      // Anti-delete detection: WhatsApp signals a "delete for everyone"
-      // as a protocolMessage of type REVOKE referencing the original key.
       const protocolMsg = msg.message.protocolMessage;
       if (protocolMsg && protocolMsg.type === 0 /* REVOKE */) {
         await handleRevoke(sock, msg, protocolMsg);
@@ -160,16 +158,14 @@ async function startBot() {
         msg.message.videoMessage?.caption ||
         "";
 
-      // Remember every message so we can recover it later if it's deleted.
       messageStore.remember(chatId, msg.key.id, {
         content: msg.message,
         sender: msg.key.participant || msg.key.remoteJid,
         timestamp: msg.messageTimestamp,
       });
 
-      if (msg.key.fromMe) continue; // don't reply to our own messages
+      if (msg.key.fromMe) continue;
 
-      // "Typing..." indicator for ~15s after receiving any message
       showTypingThenPause(sock, chatId);
 
       if (!text.startsWith(config.COMMAND_PREFIX)) continue;
@@ -190,26 +186,29 @@ async function startBot() {
 
   async function handleRevoke(sock, msg, protocolMsg) {
     if (!messageStore.isAntideleteEnabled()) return;
+    try {
+      const chatId = msg.key.remoteJid;
+      const deletedId = protocolMsg.key.id;
+      const original = messageStore.recall(chatId, deletedId);
+      if (!original) return;
 
-    const chatId = msg.key.remoteJid;
-    const deletedId = protocolMsg.key.id;
-    const original = messageStore.recall(chatId, deletedId);
-    if (!original) return; // nothing cached (e.g. sent before bot started)
+      const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
+      const originalText =
+        original.content.conversation ||
+        original.content.extendedTextMessage?.text ||
+        original.content.imageMessage?.caption ||
+        "(non-text message)";
 
-    const ownerJid = `${config.OWNER_NUMBER}@s.whatsapp.net`;
-    const originalText =
-      original.content.conversation ||
-      original.content.extendedTextMessage?.text ||
-      original.content.imageMessage?.caption ||
-      "(non-text message)";
-
-    await sock.sendMessage(ownerJid, {
-      text:
-        `🗑️ *Deleted message recovered*\n` +
-        `Chat: ${chatId}\n` +
-        `From: ${original.sender}\n` +
-        `Content: ${originalText}`,
-    });
+      await sock.sendMessage(ownerJid, {
+        text:
+          `🗑️ *Deleted message recovered*\n` +
+          `Chat: ${chatId}\n` +
+          `From: ${original.sender}\n` +
+          `Content: ${originalText}`,
+      });
+    } catch (err) {
+      console.error("Anti-delete error:", err.message || err);
+    }
   }
 
   async function routeCommand(sock, msg, chatId, text) {
@@ -244,17 +243,24 @@ async function startBot() {
       case "groupmenu":
         return sock.sendMessage(chatId, { text: groupMenu.groupMenuText() });
 
-      // ----- group-only commands below -----
       case "groupinfo": {
         if (!isGroup) return sock.sendMessage(chatId, { text: "This command only works in groups." });
-        const info = await groupMenu.handleGroupInfo(sock, chatId);
-        return sock.sendMessage(chatId, { text: info });
+        try {
+          const info = await groupMenu.handleGroupInfo(sock, chatId);
+          return sock.sendMessage(chatId, { text: info });
+        } catch (e) {
+          return sock.sendMessage(chatId, { text: "Failed to fetch group info." });
+        }
       }
 
       case "listmembers": {
         if (!isGroup) return sock.sendMessage(chatId, { text: "This command only works in groups." });
-        const list = await groupMenu.handleListMembers(sock, chatId);
-        return sock.sendMessage(chatId, { text: list });
+        try {
+          const list = await groupMenu.handleListMembers(sock, chatId);
+          return sock.sendMessage(chatId, { text: list });
+        } catch (e) {
+          return sock.sendMessage(chatId, { text: "Failed to list members." });
+        }
       }
 
       case "tag": {
@@ -275,23 +281,39 @@ async function startBot() {
 
       case "add": {
         if (!isGroup) return sock.sendMessage(chatId, { text: "This command only works in groups." });
-        if (!(await groupMenu.isBotAdmin(sock, chatId))) {
-          return sock.sendMessage(chatId, { text: "The linked account must be a group admin to add members." });
+        try {
+          if (!(await groupMenu.isBotAdmin(sock, chatId))) {
+            return sock.sendMessage(chatId, { text: "The linked account must be a group admin to add members." });
+          }
+        } catch (e) {
+          return sock.sendMessage(chatId, { text: "Could not verify admin status." });
         }
         if (!argText) return sock.sendMessage(chatId, { text: `Usage: ${config.COMMAND_PREFIX}add 2547XXXXXXXX` });
-        await groupMenu.handleAdd(sock, chatId, argText);
-        return sock.sendMessage(chatId, { text: `Add request sent for ${argText}.` });
+        try {
+          await groupMenu.handleAdd(sock, chatId, argText);
+          return sock.sendMessage(chatId, { text: `Add request sent for ${argText.replace(/\D/g, "")}.` });
+        } catch (e) {
+          return sock.sendMessage(chatId, { text: "Failed to add member." });
+        }
       }
 
       case "kick": {
         if (!isGroup) return sock.sendMessage(chatId, { text: "This command only works in groups." });
-        if (!(await groupMenu.isBotAdmin(sock, chatId))) {
-          return sock.sendMessage(chatId, { text: "The linked account must be a group admin to kick members." });
+        try {
+          if (!(await groupMenu.isBotAdmin(sock, chatId))) {
+            return sock.sendMessage(chatId, { text: "The linked account must be a group admin to kick members." });
+          }
+        } catch (e) {
+          return sock.sendMessage(chatId, { text: "Could not verify admin status." });
         }
         const mentioned = msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
         if (!mentioned.length) return sock.sendMessage(chatId, { text: `Usage: ${config.COMMAND_PREFIX}kick @member (mention them)` });
-        await groupMenu.handleKick(sock, chatId, mentioned[0]);
-        return sock.sendMessage(chatId, { text: `Removed ${mentioned[0].split("@")[0]}.` });
+        try {
+          await groupMenu.handleKick(sock, chatId, mentioned[0]);
+          return sock.sendMessage(chatId, { text: `Removed ${mentioned[0].split("@")[0]}.` });
+        } catch (e) {
+          return sock.sendMessage(chatId, { text: "Failed to remove member." });
+        }
       }
 
       default:
