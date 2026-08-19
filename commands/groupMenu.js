@@ -22,8 +22,10 @@ ${config.COMMAND_PREFIX}kick <@mention>   - remove a member`
 // number) is an admin of this group — required for kick/add per the spec.
 async function isBotAdmin(sock, groupId) {
   const metadata = await sock.groupMetadata(groupId);
-  const botId = sock.user.id.split(":")[0] + "@s.whatsapp.net";
-  const me = metadata.participants.find((p) => p.id.includes(botId.split("@")[0]));
+  // Normalize bot ID: Baileys may return "123:1@s.whatsapp.net", "123@s.whatsapp.net", or LID forms.
+  const rawId = sock.user.id;
+  const botNumber = rawId.split(":")[0].split("@")[0];
+  const me = metadata.participants.find((p) => p.id.startsWith(botNumber + "@"));
   return me?.admin === "admin" || me?.admin === "superadmin";
 }
 
@@ -64,7 +66,8 @@ async function handleLeft(sock, groupId) {
 
 // number: raw digits e.g. "2547XXXXXXXX"
 async function handleAdd(sock, groupId, number) {
-  const jid = `${number.replace(/[^0-9]/g, "")}@s.whatsapp.net`;
+  const clean = number.replace(/[^0-9]/g, "");
+  const jid = `${clean}@s.whatsapp.net`;
   return sock.groupParticipantsUpdate(groupId, [jid], "add");
 }
 
